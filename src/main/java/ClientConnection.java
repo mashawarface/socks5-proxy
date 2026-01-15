@@ -89,8 +89,6 @@ public class ClientConnection {
 
             if (toClient.position() > 0) ops |= SelectionKey.OP_WRITE;
 
-            if (ops == 0) ops = SelectionKey.OP_READ;
-
             key.interestOps(ops);
         } catch (CancelledKeyException ignored) {
         }
@@ -112,123 +110,113 @@ public class ClientConnection {
             if (toClient.hasRemaining()) ops |= SelectionKey.OP_READ;
         }
 
-        if (ops == 0) ops = SelectionKey.OP_READ;
-
         key.interestOps(ops);
     }
 
     private void processBuffers() {
-        while (true) {
-            if (state == State.HANDSHAKE) {
-                clientToUpstream.mark();
-                if (clientToUpstream.remaining() < 2) {
-                    clientToUpstream.reset();
-                    return;
-                }
-                int ver = clientToUpstream.get() & 0xFF;
-
-                int nmethods = clientToUpstream.get() & 0xFF;
-                if (clientToUpstream.remaining() < nmethods) {
-                    clientToUpstream.reset();
-                    return;
-                }
-
-                byte[] methods = new byte[nmethods];
-                clientToUpstream.get(methods);
-
-                System.out.println("[SERVER]: handshake");
-
-                if (toClient.remaining() < 2) {
-                    System.out.println("[SERVER]: toClient buffer overflow on handshake reply");
-                    close();
-                    return;
-                }
-
-                toClient.put((byte) 0x05);
-                toClient.put((byte) 0x00);
-
-                updateClientInterest();
-
-                state = State.REQUEST;
-
+        if (state == State.HANDSHAKE) {
+            clientToUpstream.mark();
+            if (clientToUpstream.remaining() < 2) {
+                clientToUpstream.reset();
                 return;
-            } else if (state == State.REQUEST) {
-                clientToUpstream.mark();
+            }
+            int ver = clientToUpstream.get() & 0xFF;
 
-                if (clientToUpstream.remaining() < 4) {
+            int nmethods = clientToUpstream.get() & 0xFF;
+            if (clientToUpstream.remaining() < nmethods) {
+                clientToUpstream.reset();
+                return;
+            }
+
+            byte[] methods = new byte[nmethods];
+            clientToUpstream.get(methods);
+
+            System.out.println("[SERVER]: handshake");
+
+            if (toClient.remaining() < 2) {
+                System.out.println("[SERVER]: toClient buffer overflow on handshake reply");
+                close();
+                return;
+            }
+
+            toClient.put((byte) 0x05);
+            toClient.put((byte) 0x00);
+
+            updateClientInterest();
+
+            state = State.REQUEST;
+
+        } else if (state == State.REQUEST) {
+            clientToUpstream.mark();
+
+            if (clientToUpstream.remaining() < 4) {
+                clientToUpstream.reset();
+                return;
+            }
+
+            int ver = clientToUpstream.get() & 0xFF;
+            int cmd = clientToUpstream.get() & 0xFF;
+
+            clientToUpstream.get();
+
+            int atyp = clientToUpstream.get() & 0xFF;
+
+            if (cmd != 0x01) {
+                System.out.println("[SERVER]: unsupported CMD");
+                sendSocksError(0x07);
+                return;
+            }
+
+            if (atyp == 0x01) {
+                if (clientToUpstream.remaining() < 6) {
                     clientToUpstream.reset();
                     return;
                 }
 
-                int ver = clientToUpstream.get() & 0xFF;
-                int cmd = clientToUpstream.get() & 0xFF;
+                byte[] addr = new byte[4];
+                clientToUpstream.get(addr);
 
-                clientToUpstream.get();
+                byte[] portb = new byte[2];
+                clientToUpstream.get(portb);
 
-                int atyp = clientToUpstream.get() & 0xFF;
+                String ip = (addr[0] & 0xFF) + "." + (addr[1] & 0xFF) + "." + (addr[2] & 0xFF) + "." + (addr[3] & 0xFF);
+                int port = ((portb[0] & 0xFF) << 8) | (portb[1] & 0xFF);
 
-                if (cmd != 0x01) {
-                    System.out.println("[SERVER]: unsupported CMD");
-                    sendSocksError(0x07);
+                System.out.println("[SERVER]: CONNECT ipv4 " + ip + ":" + port);
+
+                startConnectUpstream(ip, port);
+
+            } else if (atyp == 0x03) {
+                if (clientToUpstream.remaining() < 1) {
+                    clientToUpstream.reset();
                     return;
                 }
 
-                if (atyp == 0x01) {
-                    if (clientToUpstream.remaining() < 6) {
-                        clientToUpstream.reset();
-                        return;
-                    }
-
-                    byte[] addr = new byte[4];
-                    clientToUpstream.get(addr);
-
-                    byte[] portb = new byte[2];
-                    clientToUpstream.get(portb);
-
-                    String ip = (addr[0] & 0xFF) + "." + (addr[1] & 0xFF) + "." + (addr[2] & 0xFF) + "." + (addr[3] & 0xFF);
-                    int port = ((portb[0] & 0xFF) << 8) | (portb[1] & 0xFF);
-
-                    System.out.println("[SERVER]: CONNECT ipv4 " + ip + ":" + port);
-
-                    startConnectUpstream(ip, port);
-
-                    return;
-                } else if (atyp == 0x03) {
-                    if (clientToUpstream.remaining() < 1) {
-                        clientToUpstream.reset();
-                        return;
-                    }
-
-                    int ln = clientToUpstream.get() & 0xFF;
-                    if (clientToUpstream.remaining() < ln + 2) {
-                        clientToUpstream.reset();
-                        return;
-                    }
-
-                    byte[] nameBytes = new byte[ln];
-                    clientToUpstream.get(nameBytes);
-                    String domain = new String(nameBytes);
-
-                    byte[] portb = new byte[2];
-                    clientToUpstream.get(portb);
-                    int port = ((portb[0] & 0xFF) << 8) | (portb[1] & 0xFF);
-
-                    System.out.println("[SERVER]: CONNECT domain " + domain + ":" + port);
-
-                    state = State.WAITING_DNS;
-
-                    targetPort = port;
-
-                    dnsResolver.resolve(domain, this, port);
-
-                    return;
-                } else {
-                    System.out.println("[SERVER]: unknown ATYP");
-                    sendSocksError(0x08);
+                int ln = clientToUpstream.get() & 0xFF;
+                if (clientToUpstream.remaining() < ln + 2) {
+                    clientToUpstream.reset();
                     return;
                 }
+
+                byte[] nameBytes = new byte[ln];
+                clientToUpstream.get(nameBytes);
+                String domain = new String(nameBytes);
+
+                byte[] portb = new byte[2];
+                clientToUpstream.get(portb);
+                int port = ((portb[0] & 0xFF) << 8) | (portb[1] & 0xFF);
+
+                System.out.println("[SERVER]: CONNECT domain " + domain + ":" + port);
+
+                state = State.WAITING_DNS;
+
+                targetPort = port;
+
+                dnsResolver.resolve(domain, this, port);
+
             } else {
-                return;
+                System.out.println("[SERVER]: unknown ATYP");
+                sendSocksError(0x08);
             }
         }
     }
@@ -296,8 +284,6 @@ public class ClientConnection {
                 updateUpstreamInterest();
             }
             state = State.RELAY;
-        } catch (ClosedChannelException e) {
-            sendSocksError(0x05);
         } catch (IOException e) {
             sendSocksError(0x05);
         }
