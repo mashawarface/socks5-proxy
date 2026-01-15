@@ -3,7 +3,6 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
-import java.util.Objects;
 
 public class ClientConnection {
     enum State {HANDSHAKE, REQUEST, WAITING_DNS, CONNECTING_UPSTREAM, RELAY, ERROR, CLOSED}
@@ -19,7 +18,8 @@ public class ClientConnection {
 
     private State state = State.HANDSHAKE;
     private boolean closeAfterWrite = false;
-    private boolean upstreamClosed = false;
+    private boolean upstreamClosedWrite = false;
+    private boolean clientClosedWrite = false;
 
     private int targetPort;
 
@@ -83,7 +83,7 @@ public class ClientConnection {
 
             int ops = 0;
 
-            if (state == State.HANDSHAKE || state == State.REQUEST || state == State.RELAY) {
+            if (!clientClosedWrite && (state == State.HANDSHAKE || state == State.REQUEST || state == State.RELAY)) {
                 if (clientToUpstream.hasRemaining()) ops |= SelectionKey.OP_READ;
             }
 
@@ -95,7 +95,7 @@ public class ClientConnection {
     }
 
     private void updateUpstreamInterest() {
-        if (upstreamChannel == null) return;
+        if (upstreamChannel == null || upstreamClosedWrite) return;
 
         SelectionKey key = upstreamChannel.keyFor(selector);
 
@@ -296,14 +296,16 @@ public class ClientConnection {
 
             if (r == -1) {
                 System.out.println("[SERVER]: upstream closed");
-                upstreamClosed = true;
+                upstreamClosedWrite = true;
 
                 SelectionKey k = upstreamChannel.keyFor(selector);
-                if (k != null) k.cancel();
-                upstreamChannel.close();
+                if (k != null) k.interestOps(0);
 
-                upstreamChannel = null;
-                updateClientInterest();
+                if (toClient.position() == 0 && clientToUpstream.position() == 0) {
+                    close();
+                } else {
+                    updateClientInterest();
+                }
 
                 return;
             }
@@ -312,7 +314,7 @@ public class ClientConnection {
                 updateUpstreamInterest();
             }
         } catch (IOException e) {
-            upstreamClosed = true;
+            upstreamClosedWrite = true;
             updateClientInterest();
         }
     }
@@ -328,6 +330,10 @@ public class ClientConnection {
                 while (clientToUpstream.hasRemaining()) {
                     int written = upstreamChannel.write(clientToUpstream);
                     if (written == 0) break;
+                }
+
+                if (clientClosedWrite && clientToUpstream.position() == 0) {
+                    upstreamChannel.shutdownOutput();
                 }
             } catch (IOException e) {
                 close();
@@ -349,7 +355,17 @@ public class ClientConnection {
 
             if (r == -1) {
                 System.out.println("[SERVER]: Client closed " + clientAddressSafe());
-                close();
+                clientClosedWrite = true;
+
+                SelectionKey k = clientChannel.keyFor(selector);
+                if (k != null) k.interestOps(0);
+
+                if (toClient.position() == 0 && clientToUpstream.position() == 0) {
+                    close();
+                } else {
+                    updateUpstreamInterest();
+                }
+
                 return;
             }
 
@@ -376,16 +392,15 @@ public class ClientConnection {
             toClient.flip();
             try {
                 while (toClient.hasRemaining()) {
-                    int wrote = clientChannel.write(toClient);
-                    if (wrote == 0) break;
+                    int written = clientChannel.write(toClient);
+                    if (written == 0) break;
+                }
+
+                if (upstreamClosedWrite && toClient.position() == 0) {
+                    clientChannel.shutdownOutput();
                 }
             } finally {
                 toClient.compact();
-            }
-
-            if (toClient.position() == 0 && closeAfterWrite && upstreamClosed) {
-                close();
-                return;
             }
 
             if (toClient.position() == 0 && closeAfterWrite && state == State.ERROR) {
@@ -393,7 +408,8 @@ public class ClientConnection {
                 return;
             }
 
-            if (toClient.position() == 0 && upstreamClosed) {
+            if (toClient.position() == 0 && clientToUpstream.position() == 0 &&
+                    (clientClosedWrite || upstreamClosedWrite)) {
                 close();
                 return;
             }
